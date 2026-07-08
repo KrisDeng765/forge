@@ -3,7 +3,6 @@ from pathlib import Path
 
 from models import MessageResponse, TextBlock, ToolUseBlock
 
-
 FIXTURES = Path(__file__).parent / "fixtures"
 
 

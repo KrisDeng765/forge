@@ -2,6 +2,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+
 class TextBlock(BaseModel):
     type: Literal["text"]
     text: str
