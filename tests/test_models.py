@@ -1,14 +1,16 @@
 import json
 from pathlib import Path
+from typing import Any, cast
 
 from models import MessageResponse, TextBlock, ToolUseBlock
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def load_fixture(name: str) -> dict:
-    path = FIXTURES/name
-    return json.loads(path.read_text())
+def load_fixture(name: str) -> dict[str, Any]:
+    path = FIXTURES / name
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return cast(dict[str, Any], data)
 
 
 def test_parse_exercise_a_tool_use_response() -> None:
