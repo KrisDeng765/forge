@@ -1,6 +1,10 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
+
+import pytest
+from pydantic import ValidationError
 
 from forge.models import MessageResponse, TextBlock, ToolUseBlock, UnknownContentBlock
 
@@ -57,3 +61,10 @@ def test_unknown_block_type_is_preserved() -> None:
     assert len(unknown_blocks) == 1
     assert unknown_blocks[0].type == "telepathy"
     assert unknown_blocks[0].raw == original_block
+
+def test_malformed_known_block_is_rejected() -> None:
+    data = deepcopy(load_fixture("exercise_incomplete_response.json"))
+    data["content"][0] = {"type": "text"}
+
+    with pytest.raises(ValidationError):
+        MessageResponse.model_validate(data)

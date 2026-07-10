@@ -2,11 +2,18 @@ from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
-JsonObject = dict[str, Any]
+type JsonObject = dict[str, Any]
+KNOWN_CONTENT_BLOCK_TYPES: frozenset[str] = frozenset(
+    {"text", "tool_use", "tool_result"}
+)
 
 
 class WireModel(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+
+class RequestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 class TextBlock(WireModel):
@@ -39,9 +46,20 @@ class UnknownContentBlock(BaseModel):
             return data
 
         raw = cast(dict[str, Any], data)
+
+        if "raw" in raw and isinstance(raw.get("raw"), dict):
+            return raw
+
         block_type = raw.get("type", "unknown")
         if not isinstance(block_type, str):
             block_type = "unknown"
+
+        # Known block types are runtime protocol, not forward-compatibility surface.
+        # If one is malformed, fail validation instead of hiding it as unknown.
+        if block_type in KNOWN_CONTENT_BLOCK_TYPES:
+            raise ValueError(
+                "known content block types must validate as their concrete model"
+            )
 
         return {
             "type": block_type,
@@ -66,27 +84,25 @@ class Message(WireModel):
     content: str | list[ContentBlock]
 
 
-class ToolDefinition(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class ToolDefinition(RequestModel):
     name: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     description: str = Field(min_length=1)
     input_schema: JsonObject
 
 
-class AutoToolChoice(BaseModel):
+class AutoToolChoice(RequestModel):
     type: Literal["auto"]
 
 
-class AnyToolChoice(BaseModel):
+class AnyToolChoice(RequestModel):
     type: Literal["any"]
 
 
-class NoneToolChoice(BaseModel):
+class NoneToolChoice(RequestModel):
     type: Literal["none"]
 
 
-class NamedToolChoice(BaseModel):
+class NamedToolChoice(RequestModel):
     type: Literal["tool"]
     name: str
 
@@ -97,15 +113,23 @@ ToolChoice = Annotated[
 ]
 
 
-class CreateMessageRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class CreateMessageRequest(RequestModel):
     model: str
     max_tokens: int = Field(gt=0)
     messages: list[Message]
     system: str | None = None
     tools: list[ToolDefinition] | None = None
     tool_choice: ToolChoice | None = None
+
+
+class ErrorDetail(WireModel):
+    type: str
+    message: str
+
+
+class ErrorResponse(WireModel):
+    type: Literal["error"]
+    error: ErrorDetail
 
 
 class Usage(WireModel):
@@ -119,5 +143,7 @@ class MessageResponse(WireModel):
     role: Literal["assistant"]
     model: str
     content: list[ContentBlock]
+    # Wire parsing stays tolerant; the loop dispatch layer reintroduces strict
+    # handling by mapping known stop_reason values and surfacing unknown ones.
     stop_reason: str | None
     usage: Usage
