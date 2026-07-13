@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import Field, ValidationError
@@ -101,6 +101,24 @@ def test_tool_exception_returns_a_structured_error_result() -> None:
     assert result.is_error is True
     assert isinstance(result.content, str)
     assert "weather backend unavailable" in result.content
+
+
+def test_invalid_tool_return_is_a_structured_error_result() -> None:
+    registry = ToolRegistry()
+
+    def invalid_weather(city: str) -> str:
+        return cast(str, 42)
+
+    registry.tool(
+        description="Get the current weather for a city.",
+        input_model=CityInput,
+    )(invalid_weather)
+
+    result = registry.execute(make_tool_use("invalid_weather", {"city": "London"}))
+
+    assert result.is_error is True
+    assert isinstance(result.content, str)
+    assert "must return a string" in result.content
 
 
 def test_invalid_tool_name_fails_during_registration() -> None:

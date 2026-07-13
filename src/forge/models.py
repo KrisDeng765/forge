@@ -147,4 +147,5 @@ class MessageResponse(WireModel):
     # handling by mapping known stop_reason values and surfacing unknown ones.
     stop_reason: str | None
     stop_sequence: str | None
+    stop_details: JsonObject | None = None
     usage: Usage

@@ -60,7 +60,8 @@ The Loop interprets content blocks and `stop_reason`, executes requested tools, 
 tool results, and decides whether to continue, retry, or terminate. It also owns maximum
 iteration limits and budget reservations. Phase A defines an approval-policy interface
 that the Loop calls before side-effecting tool execution; interactive human approval is
-deferred to Phase D.
+deferred to Phase D. Phase A implements explicit stop-reason dispatch and the API-call
+limit only: retries, backoff, and budget reservations are deferred to Phase B.
 
 ### CLI
 
@@ -144,7 +145,7 @@ completed agent run until this table has been applied.
 | `stop_sequence` | Complete by caller rule | Surface the generated content and the matching `stop_sequence`, then terminate successfully. | Append the complete assistant turn. |
 | `tool_use` | Tool round | Require at least one valid client `tool_use` block. Append the assistant turn verbatim, pass every call through the approval-policy seam, execute all calls, and correlate each result or structured error by `tool_use_id`. Put all results from this response into one user message, then continue. A reason/block mismatch is a protocol error and is surfaced instead of guessed around. | Append one assistant message followed by exactly one user message containing all correlated `tool_result` blocks and no other content. |
 | `pause_turn` | Provider-side continuation | Append the paused assistant content verbatim and call the API again with the same tools and request configuration. Continue only within the dedicated continuation and total-iteration limits. Do not synthesize client tool results. | Append the paused assistant turn; add no user message. |
-| `max_tokens` | Retriable truncation | Treat the response as incomplete and never execute tool blocks from it. Account for its actual billed usage. Drop the truncated assistant turn, choose a strictly larger `max_tokens` bounded by the model limit, retry limit, and `max_affordable_M`, reserve the new attempt, and retry the same logical turn. If a larger reservation is impossible, surface truncation and terminate. | Do not append the truncated assistant turn. |
+| `max_tokens` | Truncation in Phase A | Treat the response as incomplete and never execute tool blocks from it. Surface a terminal truncation result without appending the assistant turn. Phase B will add the bounded larger-`max_tokens` retry and budget checks. | Do not append the truncated assistant turn. |
 | `model_context_window_exceeded` | Non-retriable truncation in Phase A | Treat the response as incomplete, execute no tools, surface a context-limit status with any safe partial text, and terminate. A future compaction policy may create a new request, but increasing `max_tokens` cannot fix an exhausted context window. | Do not append the truncated assistant turn. |
 | `refusal` | Refused | Surface the refusal and available `stop_details`, then terminate without tool execution. A future explicitly configured fallback-model policy may retry; Phase A does not do so implicitly. | Append the refusal turn for audit, but do not continue it. |
 | `null` | Incomplete protocol state | Accept only while assembling a streaming response. If a completed non-streaming response still has `null`, surface a protocol error and terminate. | Do not append an incomplete response. |

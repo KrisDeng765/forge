@@ -7,7 +7,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from forge.models import ToolDefinition, ToolResultBlock, ToolUseBlock
 
 P = ParamSpec("P")
-ToolFunction = Callable[..., str]
+# The public decorator promises str, but stored callables are untrusted runtime code.
+ToolFunction = Callable[..., object]
 
 
 class ToolInputModel(BaseModel):
@@ -81,17 +82,19 @@ class ToolRegistry:
 
         try:
             output = tool.function(**validated_input.model_dump(mode="python"))
+            if not isinstance(output, str):
+                raise TypeError("Registered tools must return a string.")
+
+            return ToolResultBlock(
+                type="tool_result",
+                tool_use_id=tool_use.id,
+                content=output,
+            )
         except Exception as exc:
             return _error_result(
                 tool_use.id,
                 f"Tool {tool_use.name!r} failed: {exc}",
             )
-
-        return ToolResultBlock(
-            type="tool_result",
-            tool_use_id=tool_use.id,
-            content=output,
-        )
 
 
 def _error_result(tool_use_id: str, message: str) -> ToolResultBlock:

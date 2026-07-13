@@ -72,3 +72,12 @@ def test_stop_sequence_is_exposed_as_a_typed_field() -> None:
     response = MessageResponse.model_validate(data)
 
     assert response.stop_sequence == "\n\nEND"
+
+
+def test_stop_details_is_exposed_as_a_typed_field() -> None:
+    data = load_fixture("exercise_b_tool_result_answer.json")
+    data["stop_details"] = {"reason": "policy"}
+
+    response = MessageResponse.model_validate(data)
+
+    assert response.stop_details == {"reason": "policy"}
