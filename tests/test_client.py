@@ -67,6 +67,20 @@ def test_create_message_sends_request_and_parses_success() -> None:
     assert any(isinstance(block, ToolUseBlock) for block in response.content)
 
 
+def test_malformed_success_response_is_a_typed_ambiguous_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html>Bad Gateway</html>")
+
+    with AnthropicClient(
+        api_key="fake-key",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(APIConnectionError) as exc_info:
+            client.create_message(make_request())
+
+    assert exc_info.value.request_may_have_completed is True
+
+
 def test_missing_api_key_fails_during_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

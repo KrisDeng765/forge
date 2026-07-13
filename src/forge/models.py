@@ -146,4 +146,5 @@ class MessageResponse(WireModel):
     # Wire parsing stays tolerant; the loop dispatch layer reintroduces strict
     # handling by mapping known stop_reason values and surfacing unknown ones.
     stop_reason: str | None
+    stop_sequence: str | None
     usage: Usage

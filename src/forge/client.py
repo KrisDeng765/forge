@@ -82,7 +82,15 @@ class AnthropicClient:
             ) from exc
 
         if response.is_success:
-            return MessageResponse.model_validate(response.json())
+            try:
+                return MessageResponse.model_validate(response.json())
+            except ValueError as exc:
+                # A 2xx response may still follow a completed, billable POST, so a
+                # retry must treat an unreadable body as an ambiguous completion.
+                raise APIConnectionError(
+                    "Could not parse a successful API response.",
+                    request_may_have_completed=True,
+                ) from exc
 
         _raise_status_error(response)
 

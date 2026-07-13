@@ -32,6 +32,9 @@ The Conversation State sequentially stores user, assistant, and tool-result mess
 the active run and returns a replayable snapshot of that history. It does not own the
 top-level `system` prompt, tool definitions, request budgets, or API calls. Phase A only
 provides short-term, in-process state and excludes cross-session long-term memory.
+Snapshots are deep copies so request assembly cannot mutate the state-owned transcript;
+assistant blocks are retained verbatim, including provider-added fields accepted by the
+replay experiment.
 
 ### Tool Registry
 
@@ -39,7 +42,10 @@ The Tool Registry maintains tool names, descriptions, JSON Schemas, and their
 corresponding Python callables. It exposes typed tool definitions for requests and
 resolves execution by the names supplied by the model. Before execution, it validates
 tool arguments using Pydantic, rejecting unknown tools and malformed inputs. It does not
-assemble API requests or mutate conversation history.
+assemble API requests or mutate conversation history. Each registration supplies an
+explicit Pydantic input model: its JSON Schema becomes the wire definition, parameter
+descriptions live in `Field(description=...)`, and the decorator supplies the tool-level
+description.
 
 ### Agent Loop
 
