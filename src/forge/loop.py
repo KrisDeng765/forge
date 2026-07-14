@@ -31,6 +31,20 @@ class ApprovalPolicy(Protocol):
     def approve(self, tool_name: str, tool_input: JsonObject) -> bool: ...
 
 
+class ToolObserver(Protocol):
+    def on_tool_call(self, tool_use: ToolUseBlock) -> None: ...
+
+    def on_tool_result(self, result: ToolResultBlock) -> None: ...
+
+
+class NullToolObserver:
+    def on_tool_call(self, tool_use: ToolUseBlock) -> None:
+        pass
+
+    def on_tool_result(self, result: ToolResultBlock) -> None:
+        pass
+
+
 class AlwaysApprove:
     def approve(self, tool_name: str, tool_input: JsonObject) -> bool:
         return True
@@ -86,6 +100,7 @@ class AgentLoop:
         system: str | None = None,
         max_iterations: int = 10,
         approval_policy: ApprovalPolicy | None = None,
+        observer: ToolObserver | None = None,
     ) -> None:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive.")
@@ -102,6 +117,7 @@ class AgentLoop:
         self._approval_policy = (
             approval_policy if approval_policy is not None else AlwaysApprove()
         )
+        self._observer = observer if observer is not None else NullToolObserver()
 
     def run(self) -> RunResult:
         """Run until a terminal response, protocol error, or API-call limit."""
@@ -173,24 +189,29 @@ class AgentLoop:
                 raise UnsupportedStopReasonError(response)
 
     def _execute_tool_use(self, tool_use: ToolUseBlock) -> ToolResultBlock:
+        self._observer.on_tool_call(tool_use.model_copy(deep=True))
+
         try:
             approved = self._approval_policy.approve(
                 tool_use.name,
                 deepcopy(tool_use.input),
             )
         except Exception as exc:
-            return _error_result(
+            result = _error_result(
                 tool_use.id,
                 f"Approval for tool {tool_use.name!r} failed: {exc}",
             )
+        else:
+            if not approved:
+                result = _error_result(
+                    tool_use.id,
+                    f"Tool {tool_use.name!r} was not approved.",
+                )
+            else:
+                result = self._registry.execute(tool_use)
 
-        if not approved:
-            return _error_result(
-                tool_use.id,
-                f"Tool {tool_use.name!r} was not approved.",
-            )
-
-        return self._registry.execute(tool_use)
+        self._observer.on_tool_result(result.model_copy(deep=True))
+        return result
 
     @staticmethod
     def _require_no_tool_uses(

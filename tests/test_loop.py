@@ -11,7 +11,13 @@ from forge.loop import (
     MaxIterationsExceeded,
     UnsupportedStopReasonError,
 )
-from forge.models import CreateMessageRequest, JsonObject, MessageResponse
+from forge.models import (
+    CreateMessageRequest,
+    JsonObject,
+    MessageResponse,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from forge.registry import ToolInputModel, ToolRegistry
 from forge.state import ConversationState
 
@@ -42,6 +48,15 @@ class DenyAll:
     def approve(self, tool_name: str, tool_input: JsonObject) -> bool:
         return False
 
+class RecordingObserver:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def on_tool_call(self, tool_use: ToolUseBlock) -> None:
+        self.events.append(f"call:{tool_use.name}")
+
+    def on_tool_result(self, result: ToolResultBlock) -> None:
+        self.events.append(f"result:{result.tool_use_id}:{result.is_error}")
 
 def load_response(name: str) -> MessageResponse:
     data = json.loads((FIXTURES / name).read_text(encoding="utf-8"))
@@ -118,6 +133,7 @@ def make_loop(
     registry: ToolRegistry,
     max_iterations: int = 4,
     approval_policy: DenyAll | None = None,
+    observer: RecordingObserver | None = None,
 ) -> AgentLoop:
     return AgentLoop(
         client=client,
@@ -128,6 +144,7 @@ def make_loop(
         system="Answer concisely.",
         max_iterations=max_iterations,
         approval_policy=approval_policy,
+        observer=observer,
     )
 
 
@@ -369,3 +386,28 @@ def test_duplicate_tool_use_ids_fail_before_any_tool_executes() -> None:
 
     assert calls == []
     assert [message.role for message in state.snapshot()] == ["user"]
+
+def test_observer_sees_a_tool_call_and_its_result() -> None:
+    calls: list[str] = []
+    registry = ToolRegistry()
+    register_weather_tool(registry, calls)
+    observer = RecordingObserver()
+    client = FakeClient(
+        [
+            load_response("exercise_a_tool_use.json"),
+            load_response("exercise_b_tool_result_answer.json"),
+        ]
+    )
+
+    result = make_loop(
+        client=client,
+        state=make_state(),
+        registry=registry,
+        observer=observer,
+    ).run()
+
+    assert result.status == "completed"
+    assert observer.events == [
+        "call:get_weather",
+        "result:toolu_01VpMy2As7txuxpAgFDgBEKN:None",
+    ]
