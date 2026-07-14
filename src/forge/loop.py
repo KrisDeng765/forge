@@ -2,7 +2,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from forge.errors import ForgeError
+from forge.errors import BudgetExceededError, ForgeError
+from forge.execution import TimedToolExecutor, ToolExecutor
 from forge.models import (
     CreateMessageRequest,
     JsonObject,
@@ -11,7 +12,7 @@ from forge.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from forge.registry import ToolRegistry
+from forge.registry import ToolRegistry, is_validation_error
 from forge.state import ConversationState
 
 type RunStatus = Literal[
@@ -20,6 +21,8 @@ type RunStatus = Literal[
     "refusal",
     "truncated",
     "context_limit",
+    "budget_exceeded",
+    "tool_validation_stalled",
 ]
 
 
@@ -52,15 +55,14 @@ class AlwaysApprove:
 
 @dataclass(frozen=True)
 class RunResult:
-    response: MessageResponse
+    response: MessageResponse | None
     status: RunStatus
 
     @property
     def text(self) -> str:
+        content = self.response.content if self.response is not None else []
         return "".join(
-            block.text
-            for block in self.response.content
-            if isinstance(block, TextBlock)
+            block.text for block in content if isinstance(block, TextBlock)
         )
 
 
@@ -101,11 +103,19 @@ class AgentLoop:
         max_iterations: int = 10,
         approval_policy: ApprovalPolicy | None = None,
         observer: ToolObserver | None = None,
+        tool_timeout_seconds: float = 10.0,
+        max_consecutive_validation_errors: int = 2,
+        max_validation_errors: int = 3,
+        tool_executor: ToolExecutor | None = None,
     ) -> None:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive.")
         if max_iterations <= 0:
             raise ValueError("max_iterations must be positive.")
+        if max_consecutive_validation_errors <= 0:
+            raise ValueError("max_consecutive_validation_errors must be positive.")
+        if max_validation_errors <= 0:
+            raise ValueError("max_validation_errors must be positive.")
 
         self._client = client
         self._state = state
@@ -118,12 +128,25 @@ class AgentLoop:
             approval_policy if approval_policy is not None else AlwaysApprove()
         )
         self._observer = observer if observer is not None else NullToolObserver()
+        self._tool_executor = (
+            tool_executor
+            if tool_executor is not None
+            else TimedToolExecutor(tool_timeout_seconds)
+        )
+        self._max_consecutive_validation_errors = max_consecutive_validation_errors
+        self._max_validation_errors = max_validation_errors
+        self._validation_error_count = 0
+        self._last_validation_error: tuple[str, str] | None = None
+        self._consecutive_validation_errors = 0
 
     def run(self) -> RunResult:
         """Run until a terminal response, protocol error, or API-call limit."""
 
         for _ in range(self._max_iterations):
-            response = self._client.create_message(self._build_request())
+            try:
+                response = self._client.create_message(self._build_request())
+            except BudgetExceededError:
+                return RunResult(response=None, status="budget_exceeded")
             result = self._dispatch(response)
             if result is not None:
                 return result
@@ -167,6 +190,11 @@ class AgentLoop:
                 self._state.append_assistant_blocks(response.content)
                 results = [self._execute_tool_use(tool_use) for tool_use in tool_uses]
                 self._state.append_tool_results(results)
+                if self._validation_limit_reached(tool_uses, results):
+                    return RunResult(
+                        response=response,
+                        status="tool_validation_stalled",
+                    )
                 return None
             case "pause_turn":
                 self._require_no_tool_uses(response, tool_uses)
@@ -208,7 +236,7 @@ class AgentLoop:
                     f"Tool {tool_use.name!r} was not approved.",
                 )
             else:
-                result = self._registry.execute(tool_use)
+                result = self._tool_executor.execute(self._registry, tool_use)
 
         self._observer.on_tool_result(result.model_copy(deep=True))
         return result
@@ -228,6 +256,38 @@ class AgentLoop:
         tool_use_ids = [tool_use.id for tool_use in tool_uses]
         if len(set(tool_use_ids)) != len(tool_use_ids):
             raise LoopProtocolError("A response cannot contain duplicate tool_use ids.")
+
+    def _validation_limit_reached(
+        self,
+        tool_uses: list[ToolUseBlock],
+        results: list[ToolResultBlock],
+    ) -> bool:
+        validation_errors = [
+            (tool_use.name, result.content)
+            for tool_use, result in zip(tool_uses, results, strict=True)
+            if is_validation_error(result) and isinstance(result.content, str)
+        ]
+        if not validation_errors:
+            self._last_validation_error = None
+            self._consecutive_validation_errors = 0
+            return False
+
+        self._validation_error_count += len(validation_errors)
+        if len(validation_errors) == 1:
+            signature = validation_errors[0]
+            if signature == self._last_validation_error:
+                self._consecutive_validation_errors += 1
+            else:
+                self._last_validation_error = signature
+                self._consecutive_validation_errors = 1
+        else:
+            self._last_validation_error = None
+            self._consecutive_validation_errors = 0
+
+        return (
+            self._consecutive_validation_errors >= self._max_consecutive_validation_errors
+            or self._validation_error_count >= self._max_validation_errors
+        )
 
 
 def _error_result(tool_use_id: str, message: str) -> ToolResultBlock:

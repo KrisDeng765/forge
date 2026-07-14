@@ -1,6 +1,6 @@
 from io import StringIO
 
-from forge.cli import TerminalObserver, exit_code_for, run_task
+from forge.cli import TerminalObserver, exit_code_for, parse_options, run_task
 from forge.models import (
     CreateMessageRequest,
     MessageResponse,
@@ -38,9 +38,18 @@ def make_final_response(text: str) -> MessageResponse:
 def test_exit_codes_reflect_run_status() -> None:
     assert exit_code_for("completed") == 0
     assert exit_code_for("stop_sequence") == 0
-    assert exit_code_for("refusal") == 2
+    assert exit_code_for("refusal") == 5
     assert exit_code_for("truncated") == 3
     assert exit_code_for("context_limit") == 4
+    assert exit_code_for("budget_exceeded") == 6
+
+
+def test_cli_options_allow_a_positive_budget_override() -> None:
+    task, budget = parse_options(["--budget-usd", "0.10", "Say hello."])
+
+    assert task == "Say hello."
+    assert budget.as_tuple().exponent == -2
+    assert str(budget) == "0.10"
 
 
 def test_terminal_observer_prints_tool_progress() -> None:

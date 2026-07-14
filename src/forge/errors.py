@@ -9,6 +9,14 @@ class ForgeError(Exception):
     """Base exception for all Forge runtime errors."""
 
 
+class BudgetExceededError(ForgeError):
+    """Raised before an API attempt when its maximum cost cannot fit the cap."""
+
+
+class BudgetAccountingError(ForgeError):
+    """Raised when a provider usage report exceeds the reservation for a call."""
+
+
 class APIStatusError(ForgeError):
     def __init__(
         self,

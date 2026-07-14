@@ -57,11 +57,11 @@ protocol transport in the client and state storage in Conversation State while p
 cross-component policy in the one component that has all required dependencies.
 
 The Loop interprets content blocks and `stop_reason`, executes requested tools, appends
-tool results, and decides whether to continue, retry, or terminate. It also owns maximum
-iteration limits and budget reservations. Phase A defines an approval-policy interface
-that the Loop calls before side-effecting tool execution; interactive human approval is
-deferred to Phase D. Phase A implements explicit stop-reason dispatch and the API-call
-limit only: retries, backoff, and budget reservations are deferred to Phase B.
+tool results, and decides whether to continue, retry, or terminate. It owns maximum
+iteration limits, bounded validation self-correction, and terminal states. A wrapping
+MessageClient owns retry and budget policy so the loop remains focused on orchestration.
+Phase A defines an approval-policy interface that the Loop calls before side-effecting tool
+execution; interactive human approval is deferred to Phase D.
 
 ### CLI
 
@@ -153,6 +153,64 @@ completed agent run until this table has been applied.
 
 ## Decisions
 
+### Phase B reliability policy
+
+Retry is a `MessageClient` wrapper, rather than a concern of `AgentLoop` or
+`AnthropicClient`. The transport remains single-attempt and the loop still performs one
+logical turn; the wrapper can be combined with the budget wrapper as
+`RetryingMessageClient(BudgetedMessageClient(raw_client))`. This order makes every retry a
+fresh budget reservation. Sleeps and random sampling are injected so tests record exact
+delays without real waiting.
+
+| Failure | Retry decision | Delay | Reservation treatment |
+| --- | --- | --- | --- |
+| `429` | Retry, up to 4 total attempts | Use valid `Retry-After`; otherwise full jitter | Release the failed attempt, reserve again |
+| `529` | Retry, up to 4 total attempts | Full jitter | Release the failed attempt, reserve again |
+| Connect/pool failure | Retry, up to 4 total attempts | Full jitter | Release the failed attempt, reserve again |
+| Received `500`–`599` | Retry, up to 4 total attempts | Full jitter | Release the failed attempt, reserve again |
+| Read/write timeout or post-send transport failure | At most one retry | Full jitter | Keep the first full reservation; reserve the retry independently |
+| `400`, `401`, `403`, other `4xx` | Never retry | None | Release the failed attempt |
+
+Full jitter is `uniform(0, min(8, 0.5 × 2^(n-1)))`, measured in seconds after failed
+attempt `n`. A run has a 30-second cumulative delay ceiling. A bare `500` is treated as a
+transient, explicit provider failure (not an ambiguous lost response), matching the
+provider's documented handling of 5xx failures. The retry wrapper still rejects a second
+ambiguous completion even when its overall attempt cap has not been reached.
+
+### Phase B budget ledger
+
+The ledger is a second `MessageClient` wrapper. Before every transport attempt it computes
+an input estimate `I`, reserves `I · p_in + M · p_out`, clamps `max_tokens` to the largest
+positive affordable value, and settles from actual response usage. A successful call
+releases unused reservation; an ambiguous completion retains its entire reservation.
+`BudgetExceededError` becomes the terminal `budget_exceeded` run status.
+
+Forge deliberately uses the UTF-8 byte length of compact request JSON rather than the
+token-counting endpoint for Phase B. For the current JSON-only request surface (text,
+client-side tool definitions, and JSON tool results), this is a pessimistic upper bound:
+each token consumes at least one request byte and JSON syntax adds bytes. The provider's
+token-counting endpoint is more accurate, but it is documented as an estimate and adds a
+network failure mode. Images, server tools, prompt caching, or other separately priced
+request features are out of scope until they have a dedicated estimator and pricing rule.
+
+The CLI uses a `$0.05` default hard cap for the default Haiku 4.5 model; users can set a
+positive per-run cap with `--budget-usd`. It records standard prices of `$1 / MTok` input
+and `$5 / MTok` output as decimal per-token values. These prices must be revisited when
+the default model or provider pricing changes.
+
+### Phase B bounded correction and sync tool timeout
+
+The loop records validation error signatures as `(tool name, error text)`. It stops with
+`tool_validation_stalled` after two consecutive identical validation errors or three
+validation errors total, instead of spending the general API-iteration allowance on a
+deterministically broken tool request.
+
+Every synchronous tool runs through `ThreadPoolExecutor` and `future.result(timeout=10)`.
+Timeout returns a correlated `is_error` tool result to the model. Python cannot kill a
+running thread: the worker is abandoned and its eventual output discarded. This is an
+explicit Phase B caveat, not cancellation; Phase C's async migration must provide real
+cancellation.
+
 ### Raw HTTPX instead of the Anthropic SDK
 
 Using HTTPX in Phase A forces a direct understanding of headers, request bodies, content
@@ -197,6 +255,27 @@ Developing the Agent Loop, tool protocols, and error-handling mechanics does not
 the strongest reasoning model. Utilizing Haiku reduces operational costs and shortens
 feedback latency. While subsequent evaluations will baseline against stronger models,
 the runtime architecture itself must remain model-agnostic.
+
+## CLI exit codes
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Completed or caller `stop_sequence` |
+| `1` | Runtime, configuration, or protocol error |
+| `2` | Argument usage error (owned by `argparse`) |
+| `3` | Truncated at `max_tokens` |
+| `4` | Context-window limit |
+| `5` | Model refusal |
+| `6` | Budget exceeded before an API attempt |
+| `7` | Bounded validation self-correction stalled |
+
+## Deferred register
+
+| Item | Status | Trigger |
+| --- | --- | --- |
+| Approval-defense comment in `loop.py` | Deferred | The next time `loop.py` is opened. |
+| Registry callable-signature versus Pydantic-model contract check | Deferred | Before Project 1 registers its first real tool. |
+| Six dispatch-table tests | Resolved in this Phase B opening | No trigger; maintain when a `stop_reason` changes. |
 
 ## Protocol References
 

@@ -1,10 +1,12 @@
 import json
 from pathlib import Path
+from threading import Event
 from typing import Any, cast
 
 import pytest
 from pydantic import Field
 
+from forge.errors import BudgetExceededError
 from forge.loop import (
     AgentLoop,
     LoopProtocolError,
@@ -134,6 +136,7 @@ def make_loop(
     max_iterations: int = 4,
     approval_policy: DenyAll | None = None,
     observer: RecordingObserver | None = None,
+    tool_timeout_seconds: float = 10.0,
 ) -> AgentLoop:
     return AgentLoop(
         client=client,
@@ -145,6 +148,7 @@ def make_loop(
         max_iterations=max_iterations,
         approval_policy=approval_policy,
         observer=observer,
+        tool_timeout_seconds=tool_timeout_seconds,
     )
 
 
@@ -411,3 +415,167 @@ def test_observer_sees_a_tool_call_and_its_result() -> None:
         "call:get_weather",
         "result:toolu_01VpMy2As7txuxpAgFDgBEKN:None",
     ]
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "stop_sequence", "expected_status", "expected_messages"),
+    [
+        ("end_turn", None, "completed", ["user", "assistant"]),
+        ("stop_sequence", "END", "stop_sequence", ["user", "assistant"]),
+        ("refusal", None, "refusal", ["user", "assistant"]),
+        ("max_tokens", None, "truncated", ["user"]),
+        (
+            "model_context_window_exceeded",
+            None,
+            "context_limit",
+            ["user"],
+        ),
+    ],
+)
+def test_terminal_stop_reason_dispatches_with_documented_state_mutation(
+    stop_reason: str,
+    stop_sequence: str | None,
+    expected_status: str,
+    expected_messages: list[str],
+) -> None:
+    state = make_state()
+    client = FakeClient(
+        [
+            make_response(
+                content=[{"type": "text", "text": "Terminal."}],
+                stop_reason=stop_reason,
+                stop_sequence=stop_sequence,
+            )
+        ]
+    )
+
+    result = make_loop(client=client, state=state, registry=ToolRegistry()).run()
+
+    assert result.status == expected_status
+    assert [message.role for message in state.snapshot()] == expected_messages
+
+
+def test_pause_turn_appends_then_continues_without_a_tool_result() -> None:
+    state = make_state()
+    client = FakeClient(
+        [
+            make_response(
+                content=[{"type": "text", "text": "Still working."}],
+                stop_reason="pause_turn",
+            ),
+            make_response(
+                content=[{"type": "text", "text": "Done."}],
+                stop_reason="end_turn",
+            ),
+        ]
+    )
+
+    result = make_loop(client=client, state=state, registry=ToolRegistry()).run()
+
+    assert result.status == "completed"
+    assert [message.role for message in state.snapshot()] == [
+        "user",
+        "assistant",
+        "assistant",
+    ]
+
+
+def test_repeated_validation_error_stops_before_the_iteration_limit() -> None:
+    state = make_state()
+    invalid_tool_round = make_response(
+        content=[
+            tool_use_payload(
+                tool_use_id="toolu_invalid",
+                name="get_weather",
+                tool_input={"city": 42},
+            )
+        ],
+        stop_reason="tool_use",
+    )
+    client = FakeClient([invalid_tool_round, invalid_tool_round])
+    registry = ToolRegistry()
+    register_weather_tool(registry, [])
+
+    result = make_loop(client=client, state=state, registry=registry).run()
+
+    assert result.status == "tool_validation_stalled"
+    assert len(client.requests) == 2
+    assert [message.role for message in state.snapshot()] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+    ]
+
+
+def test_budget_exceeded_has_a_terminal_result_without_a_response() -> None:
+    class OverBudgetClient:
+        def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+            raise BudgetExceededError("Budget exhausted.")
+
+    result = make_loop(
+        client=OverBudgetClient(),  # type: ignore[arg-type]
+        state=make_state(),
+        registry=ToolRegistry(),
+    ).run()
+
+    assert result.status == "budget_exceeded"
+    assert result.response is None
+    assert result.text == ""
+
+
+def test_tool_timeout_returns_a_correlated_error_result() -> None:
+    started = Event()
+    release = Event()
+    registry = ToolRegistry()
+
+    @registry.tool(
+        description="A deliberately slow weather lookup.",
+        input_model=CityInput,
+    )
+    def get_weather(city: str) -> str:
+        started.set()
+        release.wait(timeout=1.0)
+        return f"Weather for {city}"
+
+    assert callable(get_weather)
+
+    client = FakeClient(
+        [
+            make_response(
+                content=[
+                    tool_use_payload(
+                        tool_use_id="toolu_slow",
+                        name="get_weather",
+                        tool_input={"city": "London"},
+                    )
+                ],
+                stop_reason="tool_use",
+            ),
+            make_response(
+                content=[{"type": "text", "text": "Tool unavailable."}],
+                stop_reason="end_turn",
+            ),
+        ]
+    )
+    state = make_state()
+
+    try:
+        result = make_loop(
+            client=client,
+            state=state,
+            registry=registry,
+            tool_timeout_seconds=0.01,
+        ).run()
+        tool_result = state.snapshot()[2].content
+
+        assert result.status == "completed"
+        assert started.wait(timeout=1.0)
+        assert isinstance(tool_result, list)
+        timeout_result = tool_result[0]
+        assert isinstance(timeout_result, ToolResultBlock)
+        assert timeout_result.is_error is True
+        assert "exceeded its 0.01-second timeout" in str(timeout_result.content)
+    finally:
+        release.set()

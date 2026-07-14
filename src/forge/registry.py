@@ -9,6 +9,7 @@ from forge.models import ToolDefinition, ToolResultBlock, ToolUseBlock
 P = ParamSpec("P")
 # The public decorator promises str, but stored callables are untrusted runtime code.
 ToolFunction = Callable[..., object]
+VALIDATION_ERROR_PREFIX = "Invalid input for tool"
 
 
 class ToolInputModel(BaseModel):
@@ -77,7 +78,7 @@ class ToolRegistry:
         except ValidationError as exc:
             return _error_result(
                 tool_use.id,
-                f"Invalid input for tool {tool_use.name!r}: {exc}",
+                f"{VALIDATION_ERROR_PREFIX} {tool_use.name!r}: {exc}",
             )
 
         try:
@@ -103,4 +104,14 @@ def _error_result(tool_use_id: str, message: str) -> ToolResultBlock:
         tool_use_id=tool_use_id,
         content=message,
         is_error=True,
+    )
+
+
+def is_validation_error(result: ToolResultBlock) -> bool:
+    """Identify the stable validation-result shape returned by this registry."""
+
+    return (
+        result.is_error is True
+        and isinstance(result.content, str)
+        and result.content.startswith(VALIDATION_ERROR_PREFIX)
     )
