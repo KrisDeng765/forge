@@ -1,8 +1,13 @@
+import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from forge.errors import BudgetExceededError, ForgeError
+from forge.errors import (
+    AmbiguousCompletionBudgetError,
+    BudgetExceededError,
+    ForgeError,
+)
 from forge.execution import TimedToolExecutor, ToolExecutor
 from forge.models import (
     CreateMessageRequest,
@@ -14,6 +19,7 @@ from forge.models import (
 )
 from forge.registry import ToolRegistry, is_validation_error
 from forge.state import ConversationState
+from forge.streaming import StreamObserver
 
 type RunStatus = Literal[
     "completed",
@@ -22,12 +28,18 @@ type RunStatus = Literal[
     "truncated",
     "context_limit",
     "budget_exceeded",
+    "ambiguous_completion",
     "tool_validation_stalled",
 ]
 
 
 class MessageClient(Protocol):
-    def create_message(self, request: CreateMessageRequest) -> MessageResponse: ...
+    async def create_message(
+        self,
+        request: CreateMessageRequest,
+        *,
+        observer: StreamObserver | None = None,
+    ) -> MessageResponse: ...
 
 
 class ApprovalPolicy(Protocol):
@@ -107,6 +119,7 @@ class AgentLoop:
         max_consecutive_validation_errors: int = 2,
         max_validation_errors: int = 3,
         tool_executor: ToolExecutor | None = None,
+        stream_observer: StreamObserver | None = None,
     ) -> None:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive.")
@@ -133,21 +146,28 @@ class AgentLoop:
             if tool_executor is not None
             else TimedToolExecutor(tool_timeout_seconds)
         )
+        self._stream_observer = stream_observer
         self._max_consecutive_validation_errors = max_consecutive_validation_errors
         self._max_validation_errors = max_validation_errors
         self._validation_error_count = 0
         self._last_validation_error: tuple[str, str] | None = None
         self._consecutive_validation_errors = 0
+        self._inflight_tool_uses: list[ToolUseBlock] = []
 
-    def run(self) -> RunResult:
+    async def run(self) -> RunResult:
         """Run until a terminal response, protocol error, or API-call limit."""
 
         for _ in range(self._max_iterations):
             try:
-                response = self._client.create_message(self._build_request())
+                response = await self._client.create_message(
+                    self._build_request(),
+                    observer=self._stream_observer,
+                )
+            except AmbiguousCompletionBudgetError:
+                return RunResult(response=None, status="ambiguous_completion")
             except BudgetExceededError:
                 return RunResult(response=None, status="budget_exceeded")
-            result = self._dispatch(response)
+            result = await self._dispatch(response)
             if result is not None:
                 return result
 
@@ -163,7 +183,7 @@ class AgentLoop:
             messages=self._state.snapshot(),
         )
 
-    def _dispatch(self, response: MessageResponse) -> RunResult | None:
+    async def _dispatch(self, response: MessageResponse) -> RunResult | None:
         tool_uses = [
             block for block in response.content if isinstance(block, ToolUseBlock)
         ]
@@ -185,11 +205,12 @@ class AgentLoop:
                 if not tool_uses:
                     raise LoopProtocolError(
                         "stop_reason 'tool_use' requires at least one tool_use block."
-                    )
+                )
                 self._require_unique_tool_use_ids(tool_uses)
-                self._state.append_assistant_blocks(response.content)
-                results = [self._execute_tool_use(tool_use) for tool_use in tool_uses]
-                self._state.append_tool_results(results)
+                results = await self._execute_tool_uses(tool_uses)
+                # Commit only after every result exists: Ctrl-C snapshots therefore
+                # retain a complete transcript, never an orphaned tool_use turn.
+                self._state.append_tool_round(response.content, results)
                 if self._validation_limit_reached(tool_uses, results):
                     return RunResult(
                         response=response,
@@ -216,7 +237,24 @@ class AgentLoop:
             case _:
                 raise UnsupportedStopReasonError(response)
 
-    def _execute_tool_use(self, tool_use: ToolUseBlock) -> ToolResultBlock:
+    async def _execute_tool_uses(
+        self,
+        tool_uses: list[ToolUseBlock],
+    ) -> list[ToolResultBlock]:
+        self._inflight_tool_uses = [tool_use.model_copy(deep=True) for tool_use in tool_uses]
+        try:
+            results = await asyncio.gather(
+                *(self._execute_tool_use(tool_use) for tool_use in tool_uses)
+            )
+        except asyncio.CancelledError:
+            # Preserve these ids in the interrupt snapshot for manual reconciliation;
+            # completed local calls may already have had side effects.
+            raise
+        else:
+            self._inflight_tool_uses = []
+            return results
+
+    async def _execute_tool_use(self, tool_use: ToolUseBlock) -> ToolResultBlock:
         self._observer.on_tool_call(tool_use.model_copy(deep=True))
 
         try:
@@ -224,10 +262,13 @@ class AgentLoop:
                 tool_use.name,
                 deepcopy(tool_use.input),
             )
-        except Exception as exc:
+        except Exception:
+            # Fail closed: an approver error must never permit a side-effecting tool.
+            # Returning a generic error lets the model choose another safe path without
+            # disclosing policy implementation details in a model-visible tool result.
             result = _error_result(
                 tool_use.id,
-                f"Approval for tool {tool_use.name!r} failed: {exc}",
+                f"Approval for tool {tool_use.name!r} failed; the tool was not run.",
             )
         else:
             if not approved:
@@ -236,10 +277,27 @@ class AgentLoop:
                     f"Tool {tool_use.name!r} was not approved.",
                 )
             else:
-                result = self._tool_executor.execute(self._registry, tool_use)
+                result = await self._tool_executor.execute(self._registry, tool_use)
 
         self._observer.on_tool_result(result.model_copy(deep=True))
         return result
+
+    def interruption_snapshot(self) -> dict[str, object]:
+        """Return only replayable state plus unresolved work; never include secrets."""
+
+        return {
+            "snapshot_version": 1,
+            "model": self._model,
+            "max_tokens": self._max_tokens,
+            "system": self._system,
+            "messages": [
+                message.model_dump(mode="json") for message in self._state.snapshot()
+            ],
+            "unresolved_tool_uses": [
+                tool_use.model_dump(mode="json")
+                for tool_use in self._inflight_tool_uses
+            ],
+        }
 
     @staticmethod
     def _require_no_tool_uses(

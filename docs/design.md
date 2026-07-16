@@ -92,10 +92,12 @@ and contains no model protocol or e-commerce business logic.
    The Loop permits at most one automatic ambiguous-completion retry. It does not append
    an unseen assistant turn or execute any tool from it, retains the first attempt's full
    worst-case budget reservation, and starts the retry only if a second full reservation
-   still fits under the hard cap. Otherwise it halts and surfaces the ambiguity. This is
-   acceptable because duplicate effects are bounded to explicitly reserved model spend,
-   no external tool side effect can occur from the lost response, and the event is
-   recorded for audit.
+   still fits under the hard cap. If that second reservation does not fit,
+   `RetryingMessageClient` raises `AmbiguousCompletionBudgetError` chained from the first
+   ambiguous connection error; the Loop returns `ambiguous_completion`, rather than
+   concealing the unknown outcome behind `budget_exceeded`. This is acceptable because
+   duplicate effects are bounded to explicitly reserved model spend, no external tool side
+   effect can occur from the lost response, and the event is recorded for audit.
 5. **Truncated model output**
    Inspect `max_tokens` and `model_context_window_exceeded`. Never dispatch a truncated
    `tool_use` block. The exact action for each reason is defined in the dispatch table.
@@ -185,13 +187,34 @@ positive affordable value, and settles from actual response usage. A successful 
 releases unused reservation; an ambiguous completion retains its entire reservation.
 `BudgetExceededError` becomes the terminal `budget_exceeded` run status.
 
-Forge deliberately uses the UTF-8 byte length of compact request JSON rather than the
-token-counting endpoint for Phase B. For the current JSON-only request surface (text,
-client-side tool definitions, and JSON tool results), this is a pessimistic upper bound:
-each token consumes at least one request byte and JSON syntax adds bytes. The provider's
-token-counting endpoint is more accurate, but it is documented as an estimate and adds a
-network failure mode. Images, server tools, prompt caching, or other separately priced
-request features are out of scope until they have a dedicated estimator and pricing rule.
+Forge deliberately avoids the token-counting endpoint in Phase B: it is more accurate but
+is still an estimate and adds a network failure mode. For client-supplied JSON, compact
+UTF-8 byte length is deliberately pessimistic. That rule alone is not sufficient for tool
+requests: the provider injects a billable tool-use preamble which has no corresponding
+request byte. `conservative_input_token_estimate` therefore adds the model-specific
+`TOOL_USE_PREAMBLE_TOKEN_ALLOWANCE` of 512 tokens whenever `tools` is non-empty.
+
+The calibration attempt on 2026-07-15 built the smallest valid tool-bearing request
+(`model=claude-haiku-4-5-20251001`, `max_tokens=1`, user content `x`, one one-fieldless
+tool). Its compact JSON estimate was 214 tokens; the pre-registered prediction was that
+actual input would exceed 214 because of the injected preamble. The live response reported
+544 input tokens, confirming a 330-token provider-side addition. Forge reserves 512 tokens
+instead of exactly 330, retaining a 182-token guard band for this model/API-version pair
+while `BudgetAccountingError` remains a loud calibration tripwire. Re-run this exact probe
+before changing the default model, API version, or tool protocol; if observed usage exceeds
+the estimate, raise the allowance before enabling that configuration. Images, server tools,
+prompt caching, or other separately priced request features remain out of scope until they
+have dedicated estimators and pricing rules.
+
+### Phase B ambiguous-completion trace
+
+For an ambiguous first attempt, the budget wrapper retains reservation `R1`; the retry
+wrapper permits one retry, which must reserve `R2` independently. If `R2` cannot fit, the
+budget wrapper raises `BudgetExceededError` before sending a second POST. The retry wrapper
+recognizes that an earlier attempt remains unknown and raises
+`AmbiguousCompletionBudgetError` from that original `APIConnectionError`; the cause is
+preserved for logs and the Loop reports `ambiguous_completion` (exit code 8). Thus the user
+learns both facts: no retry was affordable and the first request may already have completed.
 
 The CLI uses a `$0.05` default hard cap for the default Haiku 4.5 model; users can set a
 positive per-run cap with `--budget-usd`. It records standard prices of `$1 / MTok` input
@@ -207,9 +230,52 @@ deterministically broken tool request.
 
 Every synchronous tool runs through `ThreadPoolExecutor` and `future.result(timeout=10)`.
 Timeout returns a correlated `is_error` tool result to the model. Python cannot kill a
-running thread: the worker is abandoned and its eventual output discarded. This is an
-explicit Phase B caveat, not cancellation; Phase C's async migration must provide real
-cancellation.
+running thread: the worker is abandoned and its eventual output discarded. This was an
+explicit Phase B caveat. Phase C now executes awaitable tools directly and cancels them at
+their await points. Synchronous callables run through `asyncio.to_thread` for compatibility,
+so Python still cannot force-stop a running thread; its late result is discarded.
+
+### Phase C streaming and async ADR
+
+Phase C makes one complete migration to async rather than keeping parallel synchronous and
+asynchronous paths. `AnthropicClient`, the budget and retry wrappers, `AgentLoop`, tool
+execution, and the CLI all use `async def`; the CLI is the single `asyncio.run` boundary.
+This prevents two subtly different retry, budget, and transcript implementations from
+drifting apart.
+
+Every Messages request sends `stream: true`. The raw client passes received bytes to a
+hand-written SSE parser that keeps partial lines across arbitrary HTTP chunk boundaries and
+emits events only after an SSE blank-line delimiter. The accumulator then accepts the
+ordered `message_start`, content-block, `message_delta`, and `message_stop` events. Text
+deltas are sent immediately to a stream observer; tool JSON is held per block index and is
+parsed only when `content_block_stop` arrives. The accumulator creates the same completed
+`MessageResponse` that the non-streaming loop dispatch table already understands.
+
+`message_start` provides actual input usage early. The budget wrapper compares it with its
+reservation before output is generated; an underestimated request retains its full
+reservation conservatively and raises `BudgetAccountingError`. Final usage still settles
+the reservation. A malformed or cut-off successful SSE response is an ambiguous completion,
+because the provider may already have generated and billed it. If a retry follows text that
+was already shown, the terminal prints a retry boundary; Forge never silently presents the
+second attempt as a continuation of the first. No tool executes until an entire response has
+been accumulated.
+
+Tools from a single `tool_use` response are scheduled with `asyncio.gather`. Completion may
+be out of order, but the gathered `tool_result` list remains in model block order. The
+assistant turn and all tool results are committed to `ConversationState` together only after
+the entire tool round finishes. On cancellation, the transcript therefore stops at its last
+complete turn; the snapshot separately lists unresolved tool calls for manual reconciliation.
+
+`--state-file PATH` enables an atomic JSON snapshot on Ctrl-C and returns exit code `130`.
+The snapshot has a version, UTC interruption time, run configuration, committed messages,
+and unresolved tool identifiers. It excludes credentials and deliberately does not resume
+automatically: a cancelled side-effecting tool may have changed the outside world before it
+observed cancellation.
+
+The checked-in SSE fixtures are deterministic, synthetic protocol fixtures used for
+byte-by-byte and random-chunk tests. The planned real `curl -N` capture and the two live
+milestone transcripts remain an acceptance task until an `ANTHROPIC_API_KEY` is available;
+their response-only fixture must be scrubbed of personal prompt content before committing.
 
 ### Raw HTTPX instead of the Anthropic SDK
 
@@ -268,12 +334,14 @@ the runtime architecture itself must remain model-agnostic.
 | `5` | Model refusal |
 | `6` | Budget exceeded before an API attempt |
 | `7` | Bounded validation self-correction stalled |
+| `8` | A request may have completed, but its one allowed retry could not be funded |
+| `130` | User interrupted the async run; optional state snapshot was written |
 
 ## Deferred register
 
 | Item | Status | Trigger |
 | --- | --- | --- |
-| Approval-defense comment in `loop.py` | Deferred | The next time `loop.py` is opened. |
+| Approval-defense comment in `loop.py` | Resolved in this Phase B close-out | No trigger; keep the policy fail-closed and model-visible errors generic. |
 | Registry callable-signature versus Pydantic-model contract check | Deferred | Before Project 1 registers its first real tool. |
 | Six dispatch-table tests | Resolved in this Phase B opening | No trigger; maintain when a `stop_reason` changes. |
 

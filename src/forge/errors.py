@@ -13,6 +13,10 @@ class BudgetExceededError(ForgeError):
     """Raised before an API attempt when its maximum cost cannot fit the cap."""
 
 
+class AmbiguousCompletionBudgetError(BudgetExceededError):
+    """A retry cannot be funded after an earlier request may have completed."""
+
+
 class BudgetAccountingError(ForgeError):
     """Raised when a provider usage report exceeds the reservation for a call."""
 

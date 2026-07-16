@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from threading import Event
@@ -6,11 +7,13 @@ from typing import Any, cast
 import pytest
 from pydantic import Field
 
-from forge.errors import BudgetExceededError
+from forge.errors import AmbiguousCompletionBudgetError, BudgetExceededError
 from forge.loop import (
     AgentLoop,
+    ApprovalPolicy,
     LoopProtocolError,
     MaxIterationsExceeded,
+    MessageClient,
     UnsupportedStopReasonError,
 )
 from forge.models import (
@@ -22,8 +25,15 @@ from forge.models import (
 )
 from forge.registry import ToolInputModel, ToolRegistry
 from forge.state import ConversationState
+from forge.streaming import StreamObserver
 
 FIXTURES = Path(__file__).parent / "fixtures"
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 class FakeClient:
@@ -31,7 +41,12 @@ class FakeClient:
         self._responses = list(responses)
         self.requests: list[CreateMessageRequest] = []
 
-    def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+    async def create_message(
+        self,
+        request: CreateMessageRequest,
+        *,
+        observer: StreamObserver | None = None,
+    ) -> MessageResponse:
         self.requests.append(request)
         if not self._responses:
             raise AssertionError("FakeClient received more requests than scripted responses.")
@@ -130,11 +145,11 @@ def register_clock_tool(registry: ToolRegistry, calls: list[str]) -> None:
 
 def make_loop(
     *,
-    client: FakeClient,
+    client: MessageClient,
     state: ConversationState,
     registry: ToolRegistry,
     max_iterations: int = 4,
-    approval_policy: DenyAll | None = None,
+    approval_policy: ApprovalPolicy | None = None,
     observer: RecordingObserver | None = None,
     tool_timeout_seconds: float = 10.0,
 ) -> AgentLoop:
@@ -152,7 +167,7 @@ def make_loop(
     )
 
 
-def test_tool_round_builds_fresh_requests_and_replayable_transcript() -> None:
+async def test_tool_round_builds_fresh_requests_and_replayable_transcript() -> None:
     calls: list[str] = []
     registry = ToolRegistry()
     register_weather_tool(registry, calls)
@@ -164,7 +179,7 @@ def test_tool_round_builds_fresh_requests_and_replayable_transcript() -> None:
         ]
     )
 
-    result = make_loop(client=client, state=state, registry=registry).run()
+    result = await make_loop(client=client, state=state, registry=registry).run()
 
     assert result.status == "completed"
     assert "14°C" in result.text
@@ -189,7 +204,7 @@ def test_tool_round_builds_fresh_requests_and_replayable_transcript() -> None:
     ]
 
 
-def test_unknown_tool_returns_an_error_result_and_continues() -> None:
+async def test_unknown_tool_returns_an_error_result_and_continues() -> None:
     state = make_state()
     client = FakeClient(
         [
@@ -198,7 +213,7 @@ def test_unknown_tool_returns_an_error_result_and_continues() -> None:
         ]
     )
 
-    result = make_loop(
+    result = await make_loop(
         client=client,
         state=state,
         registry=ToolRegistry(),
@@ -211,7 +226,7 @@ def test_unknown_tool_returns_an_error_result_and_continues() -> None:
     assert len(client.requests) == 2
 
 
-def test_max_iterations_counts_api_requests() -> None:
+async def test_max_iterations_counts_api_requests() -> None:
     state = make_state()
     client = FakeClient(
         [
@@ -221,7 +236,7 @@ def test_max_iterations_counts_api_requests() -> None:
     )
 
     with pytest.raises(MaxIterationsExceeded) as exc_info:
-        make_loop(
+        await make_loop(
             client=client,
             state=state,
             registry=ToolRegistry(),
@@ -232,7 +247,7 @@ def test_max_iterations_counts_api_requests() -> None:
     assert len(client.requests) == 2
 
 
-def test_multiple_tool_uses_create_one_ordered_results_message() -> None:
+async def test_multiple_tool_uses_create_one_ordered_results_message() -> None:
     calls: list[str] = []
     registry = ToolRegistry()
     register_weather_tool(registry, calls)
@@ -257,7 +272,7 @@ def test_multiple_tool_uses_create_one_ordered_results_message() -> None:
         [tool_round, load_response("exercise_b_tool_result_answer.json")]
     )
 
-    result = make_loop(client=client, state=state, registry=registry).run()
+    result = await make_loop(client=client, state=state, registry=registry).run()
 
     transcript = state.snapshot()
     results_message = transcript[2].model_dump(mode="json", exclude_none=True)
@@ -275,7 +290,7 @@ def test_multiple_tool_uses_create_one_ordered_results_message() -> None:
     ]
 
 
-def test_tool_use_reason_without_a_tool_block_is_a_protocol_error() -> None:
+async def test_tool_use_reason_without_a_tool_block_is_a_protocol_error() -> None:
     state = make_state()
     client = FakeClient(
         [
@@ -287,12 +302,12 @@ def test_tool_use_reason_without_a_tool_block_is_a_protocol_error() -> None:
     )
 
     with pytest.raises(LoopProtocolError):
-        make_loop(client=client, state=state, registry=ToolRegistry()).run()
+        await make_loop(client=client, state=state, registry=ToolRegistry()).run()
 
     assert [message.role for message in state.snapshot()] == ["user"]
 
 
-def test_denied_tool_is_returned_as_an_error_without_execution() -> None:
+async def test_denied_tool_is_returned_as_an_error_without_execution() -> None:
     calls: list[str] = []
     registry = ToolRegistry()
     register_weather_tool(registry, calls)
@@ -304,7 +319,7 @@ def test_denied_tool_is_returned_as_an_error_without_execution() -> None:
         ]
     )
 
-    result = make_loop(
+    result = await make_loop(
         client=client,
         state=state,
         registry=registry,
@@ -318,7 +333,38 @@ def test_denied_tool_is_returned_as_an_error_without_execution() -> None:
     assert "not approved" in tool_result["content"]
 
 
-def test_truncated_tool_response_never_executes_or_mutates_state() -> None:
+async def test_broken_approval_fails_closed_without_leaking_its_exception() -> None:
+    class BrokenApproval:
+        def approve(self, tool_name: str, tool_input: JsonObject) -> bool:
+            raise RuntimeError("internal policy secret")
+
+    calls: list[str] = []
+    registry = ToolRegistry()
+    register_weather_tool(registry, calls)
+    state = make_state()
+    client = FakeClient(
+        [
+            load_response("exercise_a_tool_use.json"),
+            load_response("exercise_b_tool_result_answer.json"),
+        ]
+    )
+
+    result = await make_loop(
+        client=client,
+        state=state,
+        registry=registry,
+        approval_policy=BrokenApproval(),
+    ).run()
+
+    tool_result = state.snapshot()[2].model_dump(mode="json", exclude_none=True)["content"][0]
+    assert result.status == "completed"
+    assert calls == []
+    assert tool_result["is_error"] is True
+    assert "internal policy secret" not in tool_result["content"]
+    assert "the tool was not run" in tool_result["content"]
+
+
+async def test_truncated_tool_response_never_executes_or_mutates_state() -> None:
     calls: list[str] = []
     registry = ToolRegistry()
     register_weather_tool(registry, calls)
@@ -338,14 +384,14 @@ def test_truncated_tool_response_never_executes_or_mutates_state() -> None:
         ]
     )
 
-    result = make_loop(client=client, state=state, registry=registry).run()
+    result = await make_loop(client=client, state=state, registry=registry).run()
 
     assert result.status == "truncated"
     assert calls == []
     assert [message.role for message in state.snapshot()] == ["user"]
 
 
-def test_unknown_stop_reason_preserves_state_and_raises_a_typed_error() -> None:
+async def test_unknown_stop_reason_preserves_state_and_raises_a_typed_error() -> None:
     state = make_state()
     response = make_response(
         content=[{"type": "text", "text": "Unexpected."}],
@@ -354,13 +400,13 @@ def test_unknown_stop_reason_preserves_state_and_raises_a_typed_error() -> None:
     client = FakeClient([response])
 
     with pytest.raises(UnsupportedStopReasonError) as exc_info:
-        make_loop(client=client, state=state, registry=ToolRegistry()).run()
+        await make_loop(client=client, state=state, registry=ToolRegistry()).run()
 
     assert exc_info.value.response is response
     assert [message.role for message in state.snapshot()] == ["user"]
 
 
-def test_duplicate_tool_use_ids_fail_before_any_tool_executes() -> None:
+async def test_duplicate_tool_use_ids_fail_before_any_tool_executes() -> None:
     calls: list[str] = []
     registry = ToolRegistry()
     register_weather_tool(registry, calls)
@@ -386,12 +432,12 @@ def test_duplicate_tool_use_ids_fail_before_any_tool_executes() -> None:
     )
 
     with pytest.raises(LoopProtocolError):
-        make_loop(client=client, state=state, registry=registry).run()
+        await make_loop(client=client, state=state, registry=registry).run()
 
     assert calls == []
     assert [message.role for message in state.snapshot()] == ["user"]
 
-def test_observer_sees_a_tool_call_and_its_result() -> None:
+async def test_observer_sees_a_tool_call_and_its_result() -> None:
     calls: list[str] = []
     registry = ToolRegistry()
     register_weather_tool(registry, calls)
@@ -403,7 +449,7 @@ def test_observer_sees_a_tool_call_and_its_result() -> None:
         ]
     )
 
-    result = make_loop(
+    result = await make_loop(
         client=client,
         state=make_state(),
         registry=registry,
@@ -432,7 +478,7 @@ def test_observer_sees_a_tool_call_and_its_result() -> None:
         ),
     ],
 )
-def test_terminal_stop_reason_dispatches_with_documented_state_mutation(
+async def test_terminal_stop_reason_dispatches_with_documented_state_mutation(
     stop_reason: str,
     stop_sequence: str | None,
     expected_status: str,
@@ -449,13 +495,13 @@ def test_terminal_stop_reason_dispatches_with_documented_state_mutation(
         ]
     )
 
-    result = make_loop(client=client, state=state, registry=ToolRegistry()).run()
+    result = await make_loop(client=client, state=state, registry=ToolRegistry()).run()
 
     assert result.status == expected_status
     assert [message.role for message in state.snapshot()] == expected_messages
 
 
-def test_pause_turn_appends_then_continues_without_a_tool_result() -> None:
+async def test_pause_turn_appends_then_continues_without_a_tool_result() -> None:
     state = make_state()
     client = FakeClient(
         [
@@ -470,7 +516,7 @@ def test_pause_turn_appends_then_continues_without_a_tool_result() -> None:
         ]
     )
 
-    result = make_loop(client=client, state=state, registry=ToolRegistry()).run()
+    result = await make_loop(client=client, state=state, registry=ToolRegistry()).run()
 
     assert result.status == "completed"
     assert [message.role for message in state.snapshot()] == [
@@ -480,7 +526,7 @@ def test_pause_turn_appends_then_continues_without_a_tool_result() -> None:
     ]
 
 
-def test_repeated_validation_error_stops_before_the_iteration_limit() -> None:
+async def test_repeated_validation_error_stops_before_the_iteration_limit() -> None:
     state = make_state()
     invalid_tool_round = make_response(
         content=[
@@ -496,7 +542,7 @@ def test_repeated_validation_error_stops_before_the_iteration_limit() -> None:
     registry = ToolRegistry()
     register_weather_tool(registry, [])
 
-    result = make_loop(client=client, state=state, registry=registry).run()
+    result = await make_loop(client=client, state=state, registry=registry).run()
 
     assert result.status == "tool_validation_stalled"
     assert len(client.requests) == 2
@@ -509,13 +555,18 @@ def test_repeated_validation_error_stops_before_the_iteration_limit() -> None:
     ]
 
 
-def test_budget_exceeded_has_a_terminal_result_without_a_response() -> None:
+async def test_budget_exceeded_has_a_terminal_result_without_a_response() -> None:
     class OverBudgetClient:
-        def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+        async def create_message(
+            self,
+            request: CreateMessageRequest,
+            *,
+            observer: StreamObserver | None = None,
+        ) -> MessageResponse:
             raise BudgetExceededError("Budget exhausted.")
 
-    result = make_loop(
-        client=OverBudgetClient(),  # type: ignore[arg-type]
+    result = await make_loop(
+        client=OverBudgetClient(),
         state=make_state(),
         registry=ToolRegistry(),
     ).run()
@@ -525,7 +576,28 @@ def test_budget_exceeded_has_a_terminal_result_without_a_response() -> None:
     assert result.text == ""
 
 
-def test_tool_timeout_returns_a_correlated_error_result() -> None:
+async def test_ambiguous_completion_is_a_distinct_terminal_result() -> None:
+    class AmbiguousClient:
+        async def create_message(
+            self,
+            request: CreateMessageRequest,
+            *,
+            observer: StreamObserver | None = None,
+        ) -> MessageResponse:
+            raise AmbiguousCompletionBudgetError("A retry could not be funded.")
+
+    result = await make_loop(
+        client=AmbiguousClient(),
+        state=make_state(),
+        registry=ToolRegistry(),
+    ).run()
+
+    assert result.status == "ambiguous_completion"
+    assert result.response is None
+    assert result.text == ""
+
+
+async def test_tool_timeout_returns_a_correlated_error_result() -> None:
     started = Event()
     release = Event()
     registry = ToolRegistry()
@@ -562,7 +634,7 @@ def test_tool_timeout_returns_a_correlated_error_result() -> None:
     state = make_state()
 
     try:
-        result = make_loop(
+        result = await make_loop(
             client=client,
             state=state,
             registry=registry,
@@ -579,3 +651,117 @@ def test_tool_timeout_returns_a_correlated_error_result() -> None:
         assert "exceeded its 0.01-second timeout" in str(timeout_result.content)
     finally:
         release.set()
+
+
+async def test_async_tools_run_concurrently_but_results_keep_block_order() -> None:
+    completion_order: list[str] = []
+    registry = ToolRegistry()
+
+    @registry.tool(
+        description="A slow async weather lookup.",
+        input_model=CityInput,
+    )
+    async def get_weather(city: str) -> str:
+        await asyncio.sleep(0.20)
+        completion_order.append("weather")
+        return f"Weather for {city}"
+
+    @registry.tool(
+        description="A quick async clock lookup.",
+        input_model=EmptyInput,
+    )
+    async def get_clock() -> str:
+        await asyncio.sleep(0.05)
+        completion_order.append("clock")
+        return "12:00 UTC"
+
+    assert callable(get_weather)
+    assert callable(get_clock)
+
+    tool_round = make_response(
+        content=[
+            tool_use_payload(
+                tool_use_id="toolu_weather",
+                name="get_weather",
+                tool_input={"city": "London"},
+            ),
+            tool_use_payload(
+                tool_use_id="toolu_clock",
+                name="get_clock",
+                tool_input={},
+            ),
+        ],
+        stop_reason="tool_use",
+    )
+    state = make_state()
+    loop = make_loop(
+        client=FakeClient(
+            [
+                tool_round,
+                make_response(
+                    content=[{"type": "text", "text": "Done."}],
+                    stop_reason="end_turn",
+                ),
+            ]
+        ),
+        state=state,
+        registry=registry,
+    )
+
+    started_at = asyncio.get_running_loop().time()
+    result = await loop.run()
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    result_blocks = state.snapshot()[2].model_dump(mode="json")["content"]
+    assert result.status == "completed"
+    assert completion_order == ["clock", "weather"]
+    assert [block["tool_use_id"] for block in result_blocks] == [
+        "toolu_weather",
+        "toolu_clock",
+    ]
+    assert elapsed < 0.23
+
+
+async def test_cancelling_inflight_tools_keeps_the_transcript_at_a_safe_boundary() -> None:
+    started = asyncio.Event()
+    never_finishes = asyncio.Event()
+    registry = ToolRegistry()
+
+    @registry.tool(
+        description="A cancellable async weather lookup.",
+        input_model=CityInput,
+    )
+    async def get_weather(city: str) -> str:
+        started.set()
+        await never_finishes.wait()
+        return city
+
+    assert callable(get_weather)
+
+    tool_round = make_response(
+        content=[
+            tool_use_payload(
+                tool_use_id="toolu_cancelled",
+                name="get_weather",
+                tool_input={"city": "London"},
+            )
+        ],
+        stop_reason="tool_use",
+    )
+    loop = make_loop(
+        client=FakeClient([tool_round]),
+        state=make_state(),
+        registry=registry,
+    )
+    task = asyncio.create_task(loop.run())
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    snapshot = loop.interruption_snapshot()
+    messages = cast(list[object], snapshot["messages"])
+    unresolved = cast(list[dict[str, object]], snapshot["unresolved_tool_uses"])
+    assert len(messages) == 1
+    assert unresolved[0]["id"] == "toolu_cancelled"

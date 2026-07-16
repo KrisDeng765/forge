@@ -1,4 +1,6 @@
-from collections.abc import Callable
+import asyncio
+import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import ParamSpec
 
@@ -35,10 +37,15 @@ class ToolRegistry:
         description: str,
         input_model: type[ToolInputModel],
         name: str | None = None,
-    ) -> Callable[[Callable[P, str]], Callable[P, str]]:
+    ) -> Callable[
+        [Callable[P, str] | Callable[P, Awaitable[str]]],
+        Callable[P, str] | Callable[P, Awaitable[str]],
+    ]:
         """Register a typed function and return it unchanged."""
 
-        def register(function: Callable[P, str]) -> Callable[P, str]:
+        def register(
+            function: Callable[P, str] | Callable[P, Awaitable[str]],
+        ) -> Callable[P, str] | Callable[P, Awaitable[str]]:
             tool_name = name if name is not None else function.__name__
             definition = ToolDefinition(
                 name=tool_name,
@@ -63,7 +70,7 @@ class ToolRegistry:
 
         return [tool.definition.model_copy(deep=True) for tool in self._tools.values()]
 
-    def execute(self, tool_use: ToolUseBlock) -> ToolResultBlock:
+    async def execute(self, tool_use: ToolUseBlock) -> ToolResultBlock:
         """Validate and execute one tool call without leaking tool failures."""
 
         tool = self._tools.get(tool_use.name)
@@ -82,7 +89,13 @@ class ToolRegistry:
             )
 
         try:
-            output = tool.function(**validated_input.model_dump(mode="python"))
+            arguments = validated_input.model_dump(mode="python")
+            if inspect.iscoroutinefunction(tool.function):
+                output = await tool.function(**arguments)
+            else:
+                output = await asyncio.to_thread(tool.function, **arguments)
+                if inspect.isawaitable(output):
+                    output = await output
             if not isinstance(output, str):
                 raise TypeError("Registered tools must return a string.")
 
@@ -91,6 +104,8 @@ class ToolRegistry:
                 tool_use_id=tool_use.id,
                 content=output,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             return _error_result(
                 tool_use.id,

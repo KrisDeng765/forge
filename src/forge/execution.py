@@ -1,6 +1,6 @@
-"""Bounded synchronous execution for local tools."""
+"""Bounded asynchronous execution for local tools."""
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import asyncio
 from typing import Protocol
 
 from forge.models import ToolResultBlock, ToolUseBlock
@@ -8,27 +8,34 @@ from forge.registry import ToolRegistry
 
 
 class ToolExecutor(Protocol):
-    def execute(self, registry: ToolRegistry, tool_use: ToolUseBlock) -> ToolResultBlock: ...
+    async def execute(
+        self,
+        registry: ToolRegistry,
+        tool_use: ToolUseBlock,
+    ) -> ToolResultBlock: ...
 
 
 class TimedToolExecutor:
-    """Run one synchronous tool in a worker and return a correlated timeout result."""
+    """Run one tool with an async timeout and a correlated timeout result."""
 
     def __init__(self, timeout_seconds: float) -> None:
         if timeout_seconds <= 0:
             raise ValueError("tool timeout must be positive.")
         self._timeout_seconds = timeout_seconds
 
-    def execute(self, registry: ToolRegistry, tool_use: ToolUseBlock) -> ToolResultBlock:
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="forge-tool")
-        future = executor.submit(registry.execute, tool_use)
+    async def execute(
+        self,
+        registry: ToolRegistry,
+        tool_use: ToolUseBlock,
+    ) -> ToolResultBlock:
         try:
-            result = future.result(timeout=self._timeout_seconds)
+            return await asyncio.wait_for(
+                registry.execute(tool_use),
+                timeout=self._timeout_seconds,
+            )
         except TimeoutError:
-            future.cancel()
-            # Python cannot kill a running thread. The worker may finish later, but its
-            # output is deliberately abandoned; Phase C's async tools will cancel work.
-            executor.shutdown(wait=False, cancel_futures=True)
+            # async tools receive cancellation at their next await point. A sync tool
+            # called through asyncio.to_thread may still finish in its abandoned thread.
             return ToolResultBlock(
                 type="tool_result",
                 tool_use_id=tool_use.id,
@@ -38,9 +45,3 @@ class TimedToolExecutor:
                 ),
                 is_error=True,
             )
-        except BaseException:
-            executor.shutdown(wait=True, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
-            return result

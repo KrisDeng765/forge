@@ -19,6 +19,7 @@ from forge.models import (
     ErrorResponse,
     MessageResponse,
 )
+from forge.streaming import SSEParser, StreamAccumulator, StreamObserver, StreamProtocolError
 
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -36,7 +37,7 @@ class AnthropicClient:
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         timeout: httpx.Timeout | None = None,
-        transport: httpx.BaseTransport | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         resolved_api_key = (
             api_key if api_key is not None else os.getenv("ANTHROPIC_API_KEY")
@@ -47,7 +48,7 @@ class AnthropicClient:
                 "ANTHROPIC_API_KEY."
             )
 
-        self._client = httpx.Client(
+        self._client = httpx.AsyncClient(
             base_url=base_url,
             headers={
                 "x-api-key": resolved_api_key.strip(),
@@ -58,12 +59,27 @@ class AnthropicClient:
             transport=transport,
         )
 
-    def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+    async def create_message(
+        self,
+        request: CreateMessageRequest,
+        *,
+        observer: StreamObserver | None = None,
+    ) -> MessageResponse:
+        payload = request.model_dump(mode="json", exclude_none=True)
+        payload["stream"] = True
         try:
-            response = self._client.post(
-                "/v1/messages",
-                json=request.model_dump(mode="json", exclude_none=True),
-            )
+            async with self._client.stream("POST", "/v1/messages", json=payload) as response:
+                if not response.is_success:
+                    await response.aread()
+                    _raise_status_error(response)
+
+                parser = SSEParser()
+                accumulator = StreamAccumulator(observer)
+                async for chunk in response.aiter_bytes():
+                    for event in parser.feed(chunk):
+                        accumulator.consume(event)
+                parser.finish()
+                return accumulator.finish()
         except httpx.ConnectTimeout as exc:
             raise APITimeoutError(str(exc), phase="connect") from exc
         except httpx.ReadTimeout as exc:
@@ -81,32 +97,29 @@ class AnthropicClient:
                 request_may_have_completed=True,
             ) from exc
 
-        if response.is_success:
-            try:
-                return MessageResponse.model_validate(response.json())
-            except ValueError as exc:
-                # A 2xx response may still follow a completed, billable POST, so a
-                # retry must treat an unreadable body as an ambiguous completion.
-                raise APIConnectionError(
-                    "Could not parse a successful API response.",
-                    request_may_have_completed=True,
-                ) from exc
+        except StreamProtocolError as exc:
+            # A successful stream may have generated a billable response even if its
+            # framing is incomplete or malformed, so preserve the Phase B ambiguity
+            # rule instead of retrying as a harmless parse error.
+            raise APIConnectionError(
+                "Could not assemble a successful streaming API response: "
+                f"{exc}",
+                request_may_have_completed=True,
+            ) from exc
 
-        _raise_status_error(response)
+    async def close(self) -> None:
+        await self._client.aclose()
 
-    def close(self) -> None:
-        self._client.close()
-
-    def __enter__(self) -> Self:
+    async def __aenter__(self) -> Self:
         return self
 
-    def __exit__(
+    async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        self.close()
+        await self.close()
 
 
 def _raise_status_error(response: httpx.Response) -> NoReturn:

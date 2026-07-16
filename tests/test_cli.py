@@ -1,12 +1,17 @@
+import asyncio
+import json
 from io import StringIO
+from pathlib import Path
 
 from forge.cli import TerminalObserver, exit_code_for, parse_options, run_task
 from forge.models import (
     CreateMessageRequest,
     MessageResponse,
+    TextBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
+from forge.streaming import StreamObserver
 
 
 class FakeClient:
@@ -14,8 +19,17 @@ class FakeClient:
         self._response = response
         self.requests: list[CreateMessageRequest] = []
 
-    def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+    async def create_message(
+        self,
+        request: CreateMessageRequest,
+        *,
+        observer: StreamObserver | None = None,
+    ) -> MessageResponse:
         self.requests.append(request)
+        if observer is not None:
+            for block in self._response.content:
+                if isinstance(block, TextBlock):
+                    observer.on_text_delta(block.text)
         return self._response
 
 
@@ -42,19 +56,27 @@ def test_exit_codes_reflect_run_status() -> None:
     assert exit_code_for("truncated") == 3
     assert exit_code_for("context_limit") == 4
     assert exit_code_for("budget_exceeded") == 6
+    assert exit_code_for("ambiguous_completion") == 8
 
 
 def test_cli_options_allow_a_positive_budget_override() -> None:
-    task, budget = parse_options(["--budget-usd", "0.10", "Say hello."])
+    task, budget, state_file = parse_options(["--budget-usd", "0.10", "Say hello."])
 
     assert task == "Say hello."
     assert budget.as_tuple().exponent == -2
     assert str(budget) == "0.10"
+    assert state_file is None
+
+    _, _, configured_state_file = parse_options(
+        ["--state-file", "run-state.json", "Say hello."]
+    )
+    assert configured_state_file == Path("run-state.json")
 
 
 def test_terminal_observer_prints_tool_progress() -> None:
     output = StringIO()
-    observer = TerminalObserver(output)
+    text_output = StringIO()
+    observer = TerminalObserver(text_output, output)
 
     observer.on_tool_call(
         ToolUseBlock(
@@ -101,11 +123,13 @@ def test_run_task_assembles_default_tools_and_prints_the_final_answer() -> None:
     stdout = StringIO()
     stderr = StringIO()
 
-    exit_code = run_task(
-        "Say hello.",
-        client,
-        stdout=stdout,
-        stderr=stderr,
+    exit_code = asyncio.run(
+        run_task(
+            "Say hello.",
+            client,
+            stdout=stdout,
+            stderr=stderr,
+        )
     )
 
     assert exit_code == 0
@@ -117,3 +141,41 @@ def test_run_task_assembles_default_tools_and_prints_the_final_answer() -> None:
         "get_utc_time",
     ]
     assert client.requests[0].messages[0].content == "Say hello."
+
+
+def test_cancelled_run_writes_a_parseable_non_secret_snapshot(tmp_path: Path) -> None:
+    class BlockingClient:
+        async def create_message(
+            self,
+            request: CreateMessageRequest,
+            *,
+            observer: StreamObserver | None = None,
+        ) -> MessageResponse:
+            await asyncio.Event().wait()
+            raise AssertionError("The blocking request should be cancelled.")
+
+    state_file = tmp_path / "forge-state.json"
+    stdout = StringIO()
+    stderr = StringIO()
+
+    async def cancel_run() -> int:
+        task = asyncio.create_task(
+            run_task(
+                "Say hello.",
+                BlockingClient(),
+                stdout=stdout,
+                stderr=stderr,
+                state_file=state_file,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        return await task
+
+    assert asyncio.run(cancel_run()) == 130
+    snapshot = json.loads(state_file.read_text(encoding="utf-8"))
+    assert snapshot["status"] == "interrupted"
+    assert snapshot["snapshot_version"] == 1
+    assert snapshot["messages"][0]["content"] == "Say hello."
+    assert "api_key" not in json.dumps(snapshot).lower()
+    assert "state saved" in stderr.getvalue()

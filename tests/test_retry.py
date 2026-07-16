@@ -6,11 +6,23 @@ import httpx
 import pytest
 
 from forge.client import AnthropicClient
-from forge.errors import APIConnectionError, AuthenticationError
+from forge.errors import (
+    AmbiguousCompletionBudgetError,
+    APIConnectionError,
+    AuthenticationError,
+    BudgetExceededError,
+)
 from forge.models import CreateMessageRequest, Message, MessageResponse
 from forge.retry import RetryingMessageClient
+from forge.streaming import StreamObserver
 
 FIXTURES = Path(__file__).parent / "fixtures"
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 def make_request() -> CreateMessageRequest:
@@ -26,6 +38,10 @@ def load_success() -> dict[str, Any]:
     return cast(dict[str, Any], data)
 
 
+def load_stream(name: str = "streaming_text.sse") -> bytes:
+    return (FIXTURES / name).read_bytes()
+
+
 def error_body(error_type: str, message: str) -> dict[str, object]:
     return {
         "type": "error",
@@ -33,7 +49,7 @@ def error_body(error_type: str, message: str) -> dict[str, object]:
     }
 
 
-def test_chaos_sequence_retries_with_injected_sleep_and_jitter() -> None:
+async def test_chaos_sequence_retries_with_injected_sleep_and_jitter() -> None:
     calls = 0
     sleeps: list[float] = []
     jitter_bounds: list[tuple[float, float]] = []
@@ -56,7 +72,7 @@ def test_chaos_sequence_retries_with_injected_sleep_and_jitter() -> None:
             case 3:
                 raise httpx.ReadTimeout("Timed out.", request=request)
             case 4:
-                return httpx.Response(200, json=load_success())
+                return httpx.Response(200, content=load_stream())
             case _:
                 raise AssertionError("Too many attempts")
 
@@ -64,20 +80,23 @@ def test_chaos_sequence_retries_with_injected_sleep_and_jitter() -> None:
         jitter_bounds.append((lower, upper))
         return upper / 2
 
-    with AnthropicClient(
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async with AnthropicClient(
         api_key="fake-key",
         transport=httpx.MockTransport(handler),
     ) as raw_client:
         client = RetryingMessageClient(
             raw_client,
-            sleep=sleeps.append,
+            sleep=record_sleep,
             uniform=half_jitter,
             max_attempts=4,
             base_delay_seconds=0.5,
             max_delay_seconds=8.0,
             max_total_delay_seconds=10.0,
         )
-        response = client.create_message(make_request())
+        response = await client.create_message(make_request())
 
     assert isinstance(response, MessageResponse)
     assert calls == 4
@@ -85,12 +104,17 @@ def test_chaos_sequence_retries_with_injected_sleep_and_jitter() -> None:
     assert jitter_bounds == [(0.0, 1.0), (0.0, 2.0)]
 
 
-def test_ambiguous_completion_is_retried_at_most_once() -> None:
+async def test_ambiguous_completion_is_retried_at_most_once() -> None:
     calls = 0
     sleeps: list[float] = []
 
     class ScriptedClient:
-        def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+        async def create_message(
+            self,
+            request: CreateMessageRequest,
+            *,
+            observer: StreamObserver | None = None,
+        ) -> MessageResponse:
             nonlocal calls
             calls += 1
             raise APIConnectionError(
@@ -98,21 +122,58 @@ def test_ambiguous_completion_is_retried_at_most_once() -> None:
                 request_may_have_completed=True,
             )
 
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
     client = RetryingMessageClient(
         ScriptedClient(),
-        sleep=sleeps.append,
+        sleep=record_sleep,
         uniform=lambda lower, upper: upper,
         max_attempts=4,
     )
 
     with pytest.raises(APIConnectionError, match="Response lost"):
-        client.create_message(make_request())
+        await client.create_message(make_request())
 
     assert calls == 2
     assert len(sleeps) == 1
 
 
-def test_non_retryable_authentication_error_is_propagated_immediately() -> None:
+async def test_budget_refusal_after_an_ambiguous_attempt_preserves_its_cause() -> None:
+    calls = 0
+    original = APIConnectionError("Response lost.", request_may_have_completed=True)
+
+    class ScriptedClient:
+        async def create_message(
+            self,
+            request: CreateMessageRequest,
+            *,
+            observer: StreamObserver | None = None,
+        ) -> MessageResponse:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise original
+            raise BudgetExceededError("Retry cannot fit under the cap.")
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    client = RetryingMessageClient(
+        ScriptedClient(),
+        sleep=no_sleep,
+        uniform=lambda lower, upper: upper,
+        max_attempts=4,
+    )
+
+    with pytest.raises(AmbiguousCompletionBudgetError) as exc_info:
+        await client.create_message(make_request())
+
+    assert calls == 2
+    assert exc_info.value.__cause__ is original
+
+
+async def test_non_retryable_authentication_error_is_propagated_immediately() -> None:
     calls = 0
     sleeps: list[float] = []
 
@@ -124,13 +185,16 @@ def test_non_retryable_authentication_error_is_propagated_immediately() -> None:
             json=error_body("authentication_error", "Invalid API key."),
         )
 
-    with AnthropicClient(
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async with AnthropicClient(
         api_key="fake-key",
         transport=httpx.MockTransport(handler),
     ) as raw_client:
-        client = RetryingMessageClient(raw_client, sleep=sleeps.append)
+        client = RetryingMessageClient(raw_client, sleep=record_sleep)
         with pytest.raises(AuthenticationError):
-            client.create_message(make_request())
+            await client.create_message(make_request())
 
     assert calls == 1
     assert sleeps == []

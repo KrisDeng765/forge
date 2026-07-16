@@ -1,24 +1,32 @@
-"""Retry a MessageClient without giving it ownership of loop policy or state."""
+"""Retry an async MessageClient without giving it ownership of loop policy or state."""
 
+import asyncio
 import random
-import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from forge.errors import (
+    AmbiguousCompletionBudgetError,
     APIConnectionError,
     APIStatusError,
+    BudgetExceededError,
     OverloadedError,
     RateLimitError,
 )
 from forge.models import CreateMessageRequest, MessageResponse
+from forge.streaming import StreamObserver
 
-type Sleep = Callable[[float], None]
+type Sleep = Callable[[float], Awaitable[None]]
 type Uniform = Callable[[float, float], float]
 
 
 class MessageClient(Protocol):
-    def create_message(self, request: CreateMessageRequest) -> MessageResponse: ...
+    async def create_message(
+        self,
+        request: CreateMessageRequest,
+        *,
+        observer: StreamObserver | None = None,
+    ) -> MessageResponse: ...
 
 
 class RetryingMessageClient:
@@ -33,7 +41,7 @@ class RetryingMessageClient:
         self,
         client: MessageClient,
         *,
-        sleep: Sleep = time.sleep,
+        sleep: Sleep = asyncio.sleep,
         uniform: Uniform = random.uniform,
         max_attempts: int = 4,
         base_delay_seconds: float = 0.5,
@@ -57,16 +65,31 @@ class RetryingMessageClient:
         self._max_delay_seconds = max_delay_seconds
         self._max_total_delay_seconds = max_total_delay_seconds
 
-    def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+    async def create_message(
+        self,
+        request: CreateMessageRequest,
+        *,
+        observer: StreamObserver | None = None,
+    ) -> MessageResponse:
         attempts = 0
         ambiguous_retries = 0
         total_delay = 0.0
+        pending_ambiguous_completion: APIConnectionError | None = None
 
         while True:
             attempts += 1
             try:
-                return self._client.create_message(request)
+                return await self._client.create_message(request, observer=observer)
             except Exception as exc:
+                if (
+                    isinstance(exc, BudgetExceededError)
+                    and pending_ambiguous_completion is not None
+                ):
+                    raise AmbiguousCompletionBudgetError(
+                        "A prior Messages request may have completed, but the "
+                        "budget cannot fund its one permitted retry."
+                    ) from pending_ambiguous_completion
+
                 retry_after, ambiguous_completion = self._retry_policy(exc)
                 if retry_after is None or attempts >= self._max_attempts:
                     raise
@@ -81,9 +104,16 @@ class RetryingMessageClient:
                 if total_delay + delay > self._max_total_delay_seconds:
                     raise
 
-                self._sleep(delay)
+                if observer is not None:
+                    observer.on_stream_retry()
+                await self._sleep(delay)
                 total_delay += delay
                 if ambiguous_completion:
+                    if not isinstance(exc, APIConnectionError):
+                        raise AssertionError(
+                            "Only connection failures can be ambiguous completions."
+                        ) from exc
+                    pending_ambiguous_completion = exc
                     ambiguous_retries += 1
 
     def _retry_policy(self, exc: Exception) -> tuple[float | None, bool]:

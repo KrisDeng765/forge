@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any, cast
 
 import pytest
@@ -39,7 +40,9 @@ def test_registering_a_tool_creates_a_definition_and_executes_it() -> None:
         "The city whose weather is requested."
     )
 
-    result = registry.execute(make_tool_use("get_weather", {"city": "London"}))
+    result = asyncio.run(
+        registry.execute(make_tool_use("get_weather", {"city": "London"}))
+    )
 
     assert result.model_dump(mode="json", exclude_none=True) == {
         "type": "tool_result",
@@ -62,10 +65,12 @@ def test_invalid_input_returns_an_error_without_calling_the_tool() -> None:
         return city
 
     assert callable(get_weather)
-    result = registry.execute(
-        make_tool_use(
-            "get_weather",
-            {"city": "London", "unexpected": True},
+    result = asyncio.run(
+        registry.execute(
+            make_tool_use(
+                "get_weather",
+                {"city": "London", "unexpected": True},
+            )
         )
     )
 
@@ -77,7 +82,7 @@ def test_invalid_input_returns_an_error_without_calling_the_tool() -> None:
 
 
 def test_unknown_tool_returns_a_structured_error_result() -> None:
-    result = ToolRegistry().execute(make_tool_use("missing_tool", {}))
+    result = asyncio.run(ToolRegistry().execute(make_tool_use("missing_tool", {})))
 
     assert result.is_error is True
     assert result.tool_use_id == "toolu_123"
@@ -96,7 +101,9 @@ def test_tool_exception_returns_a_structured_error_result() -> None:
         raise RuntimeError("weather backend unavailable")
 
     assert callable(broken_weather)
-    result = registry.execute(make_tool_use("broken_weather", {"city": "London"}))
+    result = asyncio.run(
+        registry.execute(make_tool_use("broken_weather", {"city": "London"}))
+    )
 
     assert result.is_error is True
     assert isinstance(result.content, str)
@@ -114,7 +121,9 @@ def test_invalid_tool_return_is_a_structured_error_result() -> None:
         input_model=CityInput,
     )(invalid_weather)
 
-    result = registry.execute(make_tool_use("invalid_weather", {"city": "London"}))
+    result = asyncio.run(
+        registry.execute(make_tool_use("invalid_weather", {"city": "London"}))
+    )
 
     assert result.is_error is True
     assert isinstance(result.content, str)

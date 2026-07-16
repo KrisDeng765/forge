@@ -8,12 +8,23 @@ from typing import Protocol
 
 from forge.errors import APIConnectionError, BudgetAccountingError, BudgetExceededError
 from forge.models import CreateMessageRequest, MessageResponse, Usage
+from forge.streaming import NullStreamObserver, StreamObserver
 
 type InputTokenEstimator = Callable[[CreateMessageRequest], int]
 
+# The API injects a tool-use system preamble that is billable but absent from the
+# request JSON. This guard band is deliberately model-specific; see design.md for
+# the recorded evidence and its recalibration trigger.
+TOOL_USE_PREAMBLE_TOKEN_ALLOWANCE = 512
+
 
 class MessageClient(Protocol):
-    def create_message(self, request: CreateMessageRequest) -> MessageResponse: ...
+    async def create_message(
+        self,
+        request: CreateMessageRequest,
+        *,
+        observer: StreamObserver | None = None,
+    ) -> MessageResponse: ...
 
 
 @dataclass(frozen=True)
@@ -112,6 +123,20 @@ class BudgetLedger:
             )
         self._confirmed_spend += actual_cost
 
+    def reconcile_input(
+        self,
+        reservation: BudgetReservation,
+        actual_input_tokens: int,
+    ) -> None:
+        """Fail early when message_start disproves the request estimate."""
+
+        if actual_input_tokens < 0:
+            raise BudgetAccountingError("Provider reported negative input token usage.")
+        if actual_input_tokens > reservation.input_tokens:
+            raise BudgetAccountingError(
+                "Provider input usage exceeded the request's conservative budget estimate."
+            )
+
     def release(self, reservation: BudgetReservation) -> None:
         """Release a reservation for a response known not to have completed."""
 
@@ -159,7 +184,12 @@ class BudgetedMessageClient:
             else estimate_input_tokens
         )
 
-    def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+    async def create_message(
+        self,
+        request: CreateMessageRequest,
+        *,
+        observer: StreamObserver | None = None,
+    ) -> MessageResponse:
         input_tokens = self._estimate_input_tokens(request)
         reservation = self._ledger.reserve(
             input_tokens=input_tokens,
@@ -169,14 +199,27 @@ class BudgetedMessageClient:
             update={"max_tokens": reservation.max_tokens},
             deep=True,
         )
+        budget_observer = _BudgetObserver(
+            ledger=self._ledger,
+            reservation=reservation,
+            downstream=observer if observer is not None else NullStreamObserver(),
+        )
 
         try:
-            response = self._client.create_message(bounded_request)
+            response = await self._client.create_message(
+                bounded_request,
+                observer=budget_observer,
+            )
         except APIConnectionError as exc:
             if exc.request_may_have_completed:
                 self._ledger.retain_ambiguous(reservation)
             else:
                 self._ledger.release(reservation)
+            raise
+        except BudgetAccountingError:
+            # message_start proves that at least input tokens were billed, while the
+            # unseen remainder is unknown. Retain the full reservation conservatively.
+            self._ledger.retain_ambiguous(reservation)
             raise
         except Exception:
             self._ledger.release(reservation)
@@ -186,15 +229,41 @@ class BudgetedMessageClient:
         return response
 
 
+class _BudgetObserver:
+    def __init__(
+        self,
+        *,
+        ledger: BudgetLedger,
+        reservation: BudgetReservation,
+        downstream: StreamObserver,
+    ) -> None:
+        self._ledger = ledger
+        self._reservation = reservation
+        self._downstream = downstream
+
+    def on_text_delta(self, text: str) -> None:
+        self._downstream.on_text_delta(text)
+
+    def on_input_tokens(self, input_tokens: int) -> None:
+        self._ledger.reconcile_input(self._reservation, input_tokens)
+        self._downstream.on_input_tokens(input_tokens)
+
+    def on_stream_retry(self) -> None:
+        self._downstream.on_stream_retry()
+
+
 def conservative_input_token_estimate(request: CreateMessageRequest) -> int:
-    """Return a byte-length upper bound for Forge's current JSON-only requests.
+    """Return Forge's conservative estimate for a JSON-only Messages request.
 
     Forge currently sends text, client-side-tool definitions, and JSON tool results only.
-    Every billable tokenizer token consumes at least one request byte, while compact JSON
-    adds syntax bytes, so UTF-8 payload length is deliberately pessimistic. Image and
-    server-tool pricing need a different estimator before those request types are added.
+    Compact UTF-8 JSON byte length over-reserves the client-supplied wire payload. Tool
+    requests additionally reserve a fixed allowance for the provider-injected tool-use
+    preamble, whose tokens have no corresponding request bytes. Images, server tools,
+    prompt caching, or other separately priced request features need dedicated estimators
+    and pricing rules before they are added.
     """
 
     payload = request.model_dump(mode="json", exclude_none=True)
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-    return len(encoded)
+    preamble_allowance = TOOL_USE_PREAMBLE_TOKEN_ALLOWANCE if request.tools else 0
+    return len(encoded) + preamble_allowance

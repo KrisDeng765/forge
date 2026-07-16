@@ -28,6 +28,18 @@ class ConversationState:
             )
         )
 
+    def append_tool_round(
+        self,
+        assistant_blocks: Sequence[ContentBlock],
+        results: Sequence[ToolResultBlock],
+    ) -> None:
+        """Commit one completed tool round without exposing a half-round state."""
+
+        result_content: list[ContentBlock] = [result for result in results]
+        assistant = Message(role="assistant", content=deepcopy(list(assistant_blocks)))
+        results_message = Message(role="user", content=deepcopy(result_content))
+        self._messages.extend([assistant, results_message])
+
     def snapshot(self) -> list[Message]:
         # State owns transcript integrity; callers must not receive mutable aliases.
         return deepcopy(self._messages)

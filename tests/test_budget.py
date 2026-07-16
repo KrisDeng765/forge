@@ -1,10 +1,19 @@
+import asyncio
+import json
 from decimal import Decimal
 
 import pytest
 
-from forge.budget import BudgetedMessageClient, BudgetLedger, ModelPricing
-from forge.errors import APIConnectionError, BudgetExceededError
-from forge.models import CreateMessageRequest, Message, MessageResponse
+from forge.budget import (
+    TOOL_USE_PREAMBLE_TOKEN_ALLOWANCE,
+    BudgetedMessageClient,
+    BudgetLedger,
+    ModelPricing,
+    conservative_input_token_estimate,
+)
+from forge.errors import APIConnectionError, BudgetAccountingError, BudgetExceededError
+from forge.models import CreateMessageRequest, Message, MessageResponse, ToolDefinition
+from forge.streaming import StreamObserver
 
 
 def make_request(max_tokens: int = 40) -> CreateMessageRequest:
@@ -40,12 +49,48 @@ def make_ledger(cap: str = "0.55") -> BudgetLedger:
     )
 
 
+def test_tool_requests_reserve_the_provider_preamble_allowance() -> None:
+    without_tools = make_request()
+    with_tools = without_tools.model_copy(
+        update={
+            "tools": [
+                ToolDefinition(
+                    name="x",
+                    description="x",
+                    input_schema={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                )
+            ]
+        },
+        deep=True,
+    )
+
+    def compact_json_bytes(request: CreateMessageRequest) -> int:
+        payload = request.model_dump(mode="json", exclude_none=True)
+        return len(json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode())
+
+    assert conservative_input_token_estimate(without_tools) == compact_json_bytes(
+        without_tools
+    )
+    assert conservative_input_token_estimate(with_tools) == (
+        compact_json_bytes(with_tools) + TOOL_USE_PREAMBLE_TOKEN_ALLOWANCE
+    )
+
+
 def test_budget_clamps_output_and_settles_actual_usage() -> None:
     class RecordingClient:
         def __init__(self) -> None:
             self.requests: list[CreateMessageRequest] = []
 
-        def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+        async def create_message(
+            self,
+            request: CreateMessageRequest,
+            *,
+            observer: StreamObserver | None = None,
+        ) -> MessageResponse:
             self.requests.append(request)
             return make_response(input_tokens=3, output_tokens=4)
 
@@ -57,7 +102,7 @@ def test_budget_clamps_output_and_settles_actual_usage() -> None:
         estimate_input_tokens=lambda request: 4,
     )
 
-    response = client.create_message(make_request())
+    response = asyncio.run(client.create_message(make_request()))
 
     assert response.usage.output_tokens == 4
     assert raw_client.requests[0].max_tokens == 15
@@ -68,7 +113,12 @@ def test_budget_clamps_output_and_settles_actual_usage() -> None:
 
 def test_budget_keeps_reservation_after_ambiguous_completion() -> None:
     class AmbiguousClient:
-        def create_message(self, request: CreateMessageRequest) -> MessageResponse:
+        async def create_message(
+            self,
+            request: CreateMessageRequest,
+            *,
+            observer: StreamObserver | None = None,
+        ) -> MessageResponse:
             raise APIConnectionError("Response lost.", request_may_have_completed=True)
 
     ledger = make_ledger(cap="0.50")
@@ -79,9 +129,35 @@ def test_budget_keeps_reservation_after_ambiguous_completion() -> None:
     )
 
     with pytest.raises(APIConnectionError, match="Response lost"):
-        client.create_message(make_request())
+        asyncio.run(client.create_message(make_request()))
 
     assert ledger.confirmed_spend == Decimal("0")
     assert ledger.ambiguous_reservations == Decimal("0.50")
     with pytest.raises(BudgetExceededError):
-        client.create_message(make_request())
+        asyncio.run(client.create_message(make_request()))
+
+
+def test_message_start_reconciles_input_usage_before_output_is_generated() -> None:
+    class UnderestimatedClient:
+        async def create_message(
+            self,
+            request: CreateMessageRequest,
+            *,
+            observer: StreamObserver | None = None,
+        ) -> MessageResponse:
+            assert observer is not None
+            observer.on_input_tokens(5)
+            return make_response(input_tokens=5, output_tokens=1)
+
+    ledger = make_ledger(cap="0.55")
+    client = BudgetedMessageClient(
+        UnderestimatedClient(),
+        ledger,
+        estimate_input_tokens=lambda request: 4,
+    )
+
+    with pytest.raises(BudgetAccountingError, match="input usage"):
+        asyncio.run(client.create_message(make_request()))
+
+    assert ledger.active_reservations == 0
+    assert ledger.ambiguous_reservations == Decimal("0.55")
